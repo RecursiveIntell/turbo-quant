@@ -63,7 +63,10 @@ fn high_bits_gives_low_relative_error() {
     }
 
     let avg = total_relative_error / n as f32;
-    assert!(avg < 0.05, "avg relative error too high at 16 bits: {avg:.4}");
+    assert!(
+        avg < 0.05,
+        "avg relative error too high at 16 bits: {avg:.4}"
+    );
 }
 
 /// TurboQuant self-similarity: ⟨x, x⟩ = ||x||² > 0.
@@ -114,7 +117,10 @@ fn l2_distance_to_self_is_near_zero() {
     // Won't be exactly zero due to compression, but should be small at 16 bits.
     let norm_sq: f32 = x.iter().map(|v| v * v).sum();
     let relative = dist / norm_sq;
-    assert!(relative < 0.1, "relative self-distance too large: {relative:.4}");
+    assert!(
+        relative < 0.1,
+        "relative self-distance too large: {relative:.4}"
+    );
 }
 
 /// Nearest-neighbor recall: top-k by estimate should mostly match top-k exact.

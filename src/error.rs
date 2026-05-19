@@ -22,6 +22,12 @@ pub enum TurboQuantError {
 
     #[error("polar code is malformed: {reason}")]
     MalformedCode { reason: String },
+
+    #[error("input vector contains non-finite value at index {index}")]
+    NonFiniteInput { index: usize },
+
+    #[error("codec profile mismatch: {reason}")]
+    ProfileMismatch { reason: String },
 }
 
 pub type Result<T> = std::result::Result<T, TurboQuantError>;

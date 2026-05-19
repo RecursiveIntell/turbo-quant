@@ -1,15 +1,14 @@
-//! TurboQuant: two-stage vector compression combining PolarQuant and QJL.
+//! TurboQuant: profile-selected vector compression using PolarQuant with optional QJL.
 //!
-//! TurboQuant achieves near-optimal distortion at b bits per value by splitting
-//! its bit budget across two stages:
+//! TurboQuant can split its bit budget across two stages:
 //!
 //! 1. **PolarQuant stage** (b−1 bits): Compress the vector via polar encoding.
 //!    Captures the main signal with high fidelity.
 //!
-//! 2. **QJL stage** (1 bit per projection): Apply the Quantized Johnson-Lindenstrauss
+//! 2. **Optional QJL stage** (1 bit per projection): Apply the Quantized Johnson-Lindenstrauss
 //!    transform to the *residual* (original minus PolarQuant reconstruction).
-//!    This provides a provably unbiased correction to the inner product estimate,
-//!    eliminating the systematic bias that PolarQuant introduces at lower bit widths.
+//!    This provides a residual correction path whose quality must be benchmarked
+//!    for the workload.
 //!
 //! # Inner Product Estimation
 //!
@@ -19,12 +18,13 @@
 //! ⟨x, y⟩ ≈ IP_polar(code, y) + IP_qjl(residual_sketch, y)
 //! ```
 //!
-//! This is provably unbiased (see TurboQuant paper, ICLR 2026).
+//! This estimator is approximate; retrieval quality still needs
+//! workload-specific recall/ranking measurement.
 //!
 //! # Reference
 //!
-//! "TurboQuant: Redefining AI Efficiency with Extreme Compression"
-//! Zandieh et al., ICLR 2026.
+//! TurboQuant-style two-stage compression with a polar code and residual
+//! quantized Johnson-Lindenstrauss sketch.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -32,10 +32,21 @@ use serde::{Deserialize, Serialize};
 use crate::{
     error::{Result, TurboQuantError},
     polar::{PolarCode, PolarQuantizer},
-    qjl::{QjlQuantizer, QjlSketch},
+    profile::{CodecProfileV1, CompressionReceiptV1, ValidationState},
+    qjl::{QjlProjectedQuery, QjlQuantizer, QjlSketch},
+    rotation::RotationKind,
 };
 
-/// A TurboQuant-compressed vector: polar code + QJL residual sketch.
+/// TurboQuant mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub enum TurboMode {
+    /// PolarQuant only. No QJL residual sketch is present.
+    PolarOnly,
+    /// PolarQuant plus a QJL residual sketch.
+    PolarWithQjl,
+}
+
+/// A TurboQuant-compressed vector: polar code plus a QJL residual sketch.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct TurboCode {
     /// PolarQuant code capturing the main signal.
@@ -45,7 +56,7 @@ pub struct TurboCode {
 }
 
 impl TurboCode {
-    /// Total approximate bytes used by this code.
+    /// Total serialized payload bytes used by this code.
     pub fn encoded_bytes(&self) -> usize {
         self.polar_code.encoded_bytes() + self.residual_sketch.encoded_bytes()
     }
@@ -54,6 +65,25 @@ impl TurboCode {
     pub fn compression_ratio(&self) -> f32 {
         let original = self.polar_code.dim * std::mem::size_of::<f32>();
         original as f32 / self.encoded_bytes() as f32
+    }
+
+    /// Validate this code against an expected TurboQuant profile.
+    pub fn validate_for(
+        &self,
+        dim: usize,
+        bits: u8,
+        projections: usize,
+        mode: TurboMode,
+    ) -> Result<()> {
+        let polar_bits = match mode {
+            TurboMode::PolarOnly => bits,
+            TurboMode::PolarWithQjl => bits.saturating_sub(1),
+        };
+        self.polar_code.validate_for(dim, polar_bits)?;
+        match mode {
+            TurboMode::PolarOnly => self.residual_sketch.validate_for(dim, 0),
+            TurboMode::PolarWithQjl => self.residual_sketch.validate_for(dim, projections),
+        }
     }
 }
 
@@ -70,8 +100,16 @@ pub struct TurboQuantizer {
     /// Number of QJL projections for the residual sketch.
     projections: usize,
     seed: u64,
+    mode: TurboMode,
     polar: PolarQuantizer,
-    qjl: QjlQuantizer,
+    qjl: Option<QjlQuantizer>,
+}
+
+/// Query state prepared once for scoring multiple TurboQuant codes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TurboProjectedQuery {
+    polar: crate::polar::PolarProjectedQuery,
+    qjl: Option<QjlProjectedQuery>,
 }
 
 impl TurboQuantizer {
@@ -84,16 +122,43 @@ impl TurboQuantizer {
     ///   More projections reduce variance but increase sketch size.
     /// - `seed`: deterministic seed for all random matrices
     pub fn new(dim: usize, bits: u8, projections: usize, seed: u64) -> Result<Self> {
+        Self::new_with_mode(dim, bits, projections, seed, TurboMode::PolarWithQjl)
+    }
+
+    /// Create a new TurboQuant compressor with explicit QJL mode.
+    pub fn new_with_mode(
+        dim: usize,
+        bits: u8,
+        projections: usize,
+        seed: u64,
+        mode: TurboMode,
+    ) -> Result<Self> {
+        Self::new_with_mode_and_rotation(dim, bits, projections, seed, mode, RotationKind::Auto)
+    }
+
+    /// Create a new TurboQuant compressor with explicit QJL and rotation policies.
+    pub fn new_with_mode_and_rotation(
+        dim: usize,
+        bits: u8,
+        projections: usize,
+        seed: u64,
+        mode: TurboMode,
+        rotation_kind: RotationKind,
+    ) -> Result<Self> {
         if dim == 0 {
             return Err(TurboQuantError::ZeroDimension);
         }
         if dim % 2 != 0 {
             return Err(TurboQuantError::OddDimension { got: dim });
         }
-        if bits < 2 || bits > 16 {
+        let valid_bits = match mode {
+            TurboMode::PolarOnly => (1..=16).contains(&bits),
+            TurboMode::PolarWithQjl => (2..=16).contains(&bits),
+        };
+        if !valid_bits {
             return Err(TurboQuantError::InvalidBitWidth { got: bits });
         }
-        if projections == 0 {
+        if mode == TurboMode::PolarWithQjl && projections == 0 {
             return Err(TurboQuantError::ZeroProjectionCount);
         }
 
@@ -101,10 +166,42 @@ impl TurboQuantizer {
         let polar_seed = seed;
         let qjl_seed = seed.wrapping_add(0xCAFE_BABE_0000_0001);
 
-        let polar = PolarQuantizer::new(dim, bits - 1, polar_seed)?;
-        let qjl = QjlQuantizer::new(dim, projections, qjl_seed)?;
+        let polar_bits = match mode {
+            TurboMode::PolarOnly => bits,
+            TurboMode::PolarWithQjl => bits - 1,
+        };
+        let polar = PolarQuantizer::new_with_rotation(dim, polar_bits, polar_seed, rotation_kind)?;
+        let qjl = match mode {
+            TurboMode::PolarOnly => None,
+            TurboMode::PolarWithQjl => Some(QjlQuantizer::new(dim, projections, qjl_seed)?),
+        };
 
-        Ok(Self { dim, bits, projections, seed, polar, qjl })
+        Ok(Self {
+            dim,
+            bits,
+            projections,
+            seed,
+            mode,
+            polar,
+            qjl,
+        })
+    }
+
+    /// Create a TurboQuant compressor using dense QR reference rotation.
+    pub fn new_with_stored_rotation(
+        dim: usize,
+        bits: u8,
+        projections: usize,
+        seed: u64,
+    ) -> Result<Self> {
+        Self::new_with_mode_and_rotation(
+            dim,
+            bits,
+            projections,
+            seed,
+            TurboMode::PolarWithQjl,
+            RotationKind::StoredQr,
+        )
     }
 
     /// The vector dimension this quantizer operates on.
@@ -122,6 +219,33 @@ impl TurboQuantizer {
         self.projections
     }
 
+    /// Deterministic seed used to derive TurboQuant internal projection state.
+    pub fn seed(&self) -> u64 {
+        self.seed
+    }
+
+    /// TurboQuant mode. QJL is optional and must be benchmark-gated by callers.
+    pub fn mode(&self) -> TurboMode {
+        self.mode
+    }
+
+    /// Resolved PolarQuant rotation backend.
+    pub fn rotation_kind(&self) -> RotationKind {
+        self.polar.rotation_kind()
+    }
+
+    /// Stable profile for this quantizer.
+    pub fn profile(&self) -> CodecProfileV1 {
+        CodecProfileV1::turbo(
+            self.dim,
+            self.bits,
+            self.projections,
+            self.seed,
+            self.mode == TurboMode::PolarWithQjl,
+            self.polar.rotation_kind_label(),
+        )
+    }
+
     /// Encode a vector into a [`TurboCode`].
     ///
     /// # Steps
@@ -136,6 +260,7 @@ impl TurboQuantizer {
                 got: vector.len(),
             });
         }
+        check_finite_vector(vector)?;
 
         let polar_code = self.polar.encode(vector)?;
 
@@ -147,27 +272,112 @@ impl TurboQuantizer {
             .map(|(orig, rec)| orig - rec)
             .collect();
 
-        let residual_sketch = self.qjl.sketch(&residual)?;
+        let residual_sketch = match &self.qjl {
+            Some(qjl) => qjl.sketch(&residual)?,
+            None => QjlSketch {
+                dim: self.dim,
+                projections: 0,
+                signs: Vec::new(),
+            },
+        };
 
-        Ok(TurboCode { polar_code, residual_sketch })
+        Ok(TurboCode {
+            polar_code,
+            residual_sketch,
+        })
+    }
+
+    /// Encode a vector and return a receipt bound to the quantizer profile.
+    pub fn encode_with_receipt(
+        &self,
+        vector: &[f32],
+        source_digest: Option<String>,
+    ) -> Result<(TurboCode, CompressionReceiptV1)> {
+        let code = self.encode(vector)?;
+        let receipt = CompressionReceiptV1::new(
+            self.profile(),
+            source_digest,
+            vector.len(),
+            code.encoded_bytes(),
+            ValidationState::Validated,
+        );
+        Ok((code, receipt))
+    }
+
+    /// Encode a batch of vectors using the same quantizer profile.
+    pub fn encode_batch(&self, vectors: &[&[f32]]) -> Result<Vec<TurboCode>> {
+        vectors.iter().map(|vector| self.encode(vector)).collect()
     }
 
     /// Estimate ⟨original_vector, query⟩ from a [`TurboCode`] and raw query.
     ///
-    /// Combines the PolarQuant inner product estimate with the QJL residual
-    /// correction for a provably unbiased result.
+    /// Combines the PolarQuant inner product estimate with the optional QJL
+    /// residual correction.
     pub fn inner_product_estimate(&self, code: &TurboCode, query: &[f32]) -> Result<f32> {
+        let projected = self.prepare_query(query)?;
+        self.inner_product_estimate_prepared(code, &projected)
+    }
+
+    /// Prepare a query once for repeated TurboQuant scoring.
+    pub fn prepare_query(&self, query: &[f32]) -> Result<TurboProjectedQuery> {
         if query.len() != self.dim {
             return Err(TurboQuantError::DimensionMismatch {
                 expected: self.dim,
                 got: query.len(),
             });
         }
+        check_finite_vector(query)?;
+        Ok(TurboProjectedQuery {
+            polar: self.polar.project_query(query)?,
+            qjl: match &self.qjl {
+                Some(qjl) => Some(qjl.project_query(query)?),
+                None => None,
+            },
+        })
+    }
 
-        let polar_estimate = self.polar.inner_product_estimate(&code.polar_code, query)?;
-        let qjl_correction = self.qjl.inner_product_estimate(&code.residual_sketch, query)?;
+    /// Estimate inner product using a prepared query.
+    pub fn inner_product_estimate_prepared(
+        &self,
+        code: &TurboCode,
+        query: &TurboProjectedQuery,
+    ) -> Result<f32> {
+        code.validate_for(self.dim, self.bits, self.projections, self.mode)?;
 
-        Ok(polar_estimate + qjl_correction)
+        let polar_estimate = self
+            .polar
+            .inner_product_estimate_with_projected_query(&code.polar_code, &query.polar)?;
+        let qjl_correction = match (&self.qjl, &query.qjl) {
+            (Some(qjl), Some(qjl_query)) => {
+                qjl.inner_product_estimate_with_projected_query(&code.residual_sketch, qjl_query)?
+            }
+            (None, None) => 0.0,
+            _ => {
+                return Err(TurboQuantError::MalformedCode {
+                    reason: "TurboQuant QJL mode/query/code mismatch".into(),
+                });
+            }
+        };
+
+        let score = polar_estimate + qjl_correction;
+        if !score.is_finite() {
+            return Err(TurboQuantError::MalformedCode {
+                reason: "turbo score is not finite".into(),
+            });
+        }
+        Ok(score)
+    }
+
+    /// Score a batch of codes against a prepared query.
+    pub fn score_batch_prepared(
+        &self,
+        query: &TurboProjectedQuery,
+        codes: &[TurboCode],
+    ) -> Result<Vec<f32>> {
+        codes
+            .iter()
+            .map(|code| self.inner_product_estimate_prepared(code, query))
+            .collect()
     }
 
     /// Estimate squared L2 distance between the encoded vector and query.
@@ -178,7 +388,13 @@ impl TurboQuantizer {
         let ip = self.inner_product_estimate(code, query)?;
         let query_norm_sq: f32 = query.iter().map(|x| x * x).sum();
         let code_norm_sq: f32 = code.polar_code.radii.iter().map(|r| r * r).sum();
-        Ok((query_norm_sq + code_norm_sq - 2.0 * ip).max(0.0))
+        let distance = (query_norm_sq + code_norm_sq - 2.0 * ip).max(0.0);
+        if !distance.is_finite() {
+            return Err(TurboQuantError::MalformedCode {
+                reason: "turbo l2 distance is not finite".into(),
+            });
+        }
+        Ok(distance)
     }
 
     /// Decode the TurboCode to an approximate reconstruction.
@@ -186,7 +402,26 @@ impl TurboQuantizer {
     /// Note: this only reconstructs the PolarQuant component. The QJL sketch
     /// is designed for inner product correction, not reconstruction.
     pub fn decode_approximate(&self, code: &TurboCode) -> Result<Vec<f32>> {
+        code.validate_for(self.dim, self.bits, self.projections, self.mode)?;
         self.polar.decode(&code.polar_code)
+    }
+
+    /// Encode a vector into deterministic TurboQuant wire bytes.
+    pub fn encode_to_bytes(&self, vector: &[f32]) -> Result<Vec<u8>> {
+        let code = self.encode(vector)?;
+        crate::wire::TurboCodeWireV1::encode(&code, self)
+    }
+
+    /// Decode deterministic TurboQuant wire bytes into a validated code.
+    pub fn decode_code_from_bytes(&self, bytes: &[u8]) -> Result<TurboCode> {
+        crate::wire::TurboCodeWireV1::decode(bytes, self)
+    }
+
+    /// Score deterministic TurboQuant wire bytes against a raw query.
+    pub fn score_inner_product_from_bytes(&self, bytes: &[u8], query: &[f32]) -> Result<f32> {
+        let code = self.decode_code_from_bytes(bytes)?;
+        let prepared = self.prepare_query(query)?;
+        self.inner_product_estimate_prepared(&code, &prepared)
     }
 
     /// Summary statistics for a batch of encoded vectors.
@@ -204,6 +439,17 @@ impl TurboQuantizer {
             },
         }
     }
+}
+
+fn check_finite_vector(vector: &[f32]) -> Result<()> {
+    if let Some((index, _)) = vector
+        .iter()
+        .enumerate()
+        .find(|(_, value)| !value.is_finite())
+    {
+        return Err(TurboQuantError::NonFiniteInput { index });
+    }
+    Ok(())
 }
 
 /// Compression statistics for a batch of encoded vectors.
@@ -313,14 +559,17 @@ mod tests {
 
     #[test]
     fn batch_stats_sums_correctly() {
-        let q = TurboQuantizer::new(16, 8, 16, 0).unwrap();
-        let codes: Vec<_> = (0..10).map(|i| q.encode(&random_vector(16, i)).unwrap()).collect();
+        let dim = 64;
+        let q = TurboQuantizer::new(dim, 8, 16, 0).unwrap();
+        let codes: Vec<_> = (0..10)
+            .map(|i| q.encode(&random_vector(dim, i)).unwrap())
+            .collect();
         let stats = q.batch_stats(&codes);
         assert_eq!(stats.count, 10);
         assert!(stats.compression_ratio > 1.0);
         assert_eq!(
             stats.total_original_bytes,
-            10 * 16 * std::mem::size_of::<f32>()
+            10 * dim * std::mem::size_of::<f32>()
         );
     }
 

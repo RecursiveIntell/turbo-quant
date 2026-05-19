@@ -1,21 +1,105 @@
 //! Random rotation matrices for whitening high-dimensional vectors before quantization.
 //!
 //! Rotating the data before quantization simplifies the geometry, making uniform
-//! scalar quantizers near-optimal. This is the core geometric insight behind
-//! PolarQuant and TurboQuant.
+//! scalar quantizers easier to use as deterministic baselines.
 //!
 //! Two implementations are provided:
 //! - [`StoredRotation`]: full d×d orthogonal matrix via QR decomposition. Correct
 //!   for any dimension but uses O(d²) memory (~9MB at d=1536).
-//! - The [`Rotation`] trait allows swapping in a Randomized Hadamard Transform
-//!   (SRHT) for large dimensions without changing any downstream code.
+//! - [`FastHadamardRotation`]: deterministic sign rotation followed by a
+//!   normalized Hadamard transform for power-of-two dimensions.
 
 use crate::error::{Result, TurboQuantError};
 use nalgebra::DMatrix;
-use rand::SeedableRng;
+use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use rand_distr::{Distribution, StandardNormal};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+
+/// Rotation selection policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub enum RotationKind {
+    /// Use FastHadamard for supported dimensions, otherwise Stored QR.
+    Auto,
+    /// Use deterministic Hadamard/SRHT-style rotation. Requires power-of-two dimensions.
+    FastHadamard,
+    /// Use dense QR reference rotation.
+    StoredQr,
+}
+
+impl RotationKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::FastHadamard => "fast_hadamard",
+            Self::StoredQr => "stored_qr_reference",
+        }
+    }
+}
+
+/// Concrete rotation backend used by quantizers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum RotationBackend {
+    FastHadamard(FastHadamardRotation),
+    StoredQr(StoredRotation),
+}
+
+impl RotationBackend {
+    pub fn new(dim: usize, seed: u64, kind: RotationKind) -> Result<Self> {
+        match kind {
+            RotationKind::Auto if dim.is_power_of_two() => {
+                FastHadamardRotation::new(dim, seed).map(Self::FastHadamard)
+            }
+            RotationKind::Auto => StoredRotation::new(dim, seed).map(Self::StoredQr),
+            RotationKind::FastHadamard => {
+                FastHadamardRotation::new(dim, seed).map(Self::FastHadamard)
+            }
+            RotationKind::StoredQr => StoredRotation::new(dim, seed).map(Self::StoredQr),
+        }
+    }
+
+    pub fn kind(&self) -> RotationKind {
+        match self {
+            Self::FastHadamard(_) => RotationKind::FastHadamard,
+            Self::StoredQr(_) => RotationKind::StoredQr,
+        }
+    }
+
+    pub fn kind_label(&self) -> &'static str {
+        self.kind().label()
+    }
+
+    pub fn seed(&self) -> u64 {
+        match self {
+            Self::FastHadamard(rotation) => rotation.seed(),
+            Self::StoredQr(rotation) => rotation.seed(),
+        }
+    }
+}
+
+impl Rotation for RotationBackend {
+    fn dim(&self) -> usize {
+        match self {
+            Self::FastHadamard(rotation) => rotation.dim(),
+            Self::StoredQr(rotation) => rotation.dim(),
+        }
+    }
+
+    fn apply(&self, input: &[f32], output: &mut [f32]) -> Result<()> {
+        match self {
+            Self::FastHadamard(rotation) => rotation.apply(input, output),
+            Self::StoredQr(rotation) => rotation.apply(input, output),
+        }
+    }
+
+    fn apply_inverse(&self, input: &[f32], output: &mut [f32]) -> Result<()> {
+        match self {
+            Self::FastHadamard(rotation) => rotation.apply_inverse(input, output),
+            Self::StoredQr(rotation) => rotation.apply_inverse(input, output),
+        }
+    }
+}
 
 /// A rotation that can be applied to and inverted on vectors of a fixed dimension.
 pub trait Rotation: Send + Sync {
@@ -31,6 +115,63 @@ pub trait Rotation: Send + Sync {
     ///
     /// For orthogonal matrices, the inverse equals the transpose.
     fn apply_inverse(&self, input: &[f32], output: &mut [f32]) -> Result<()>;
+}
+
+/// Deterministic Hadamard/SRHT-style rotation for power-of-two dimensions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FastHadamardRotation {
+    dim: usize,
+    seed: u64,
+    signs: Vec<f32>,
+}
+
+impl FastHadamardRotation {
+    pub fn new(dim: usize, seed: u64) -> Result<Self> {
+        if dim == 0 {
+            return Err(TurboQuantError::ZeroDimension);
+        }
+        if !dim.is_power_of_two() {
+            return Err(TurboQuantError::RotationFailed {
+                reason: format!("Hadamard rotation requires a power-of-two dimension, got {dim}"),
+            });
+        }
+        let mut rng = ChaCha8Rng::seed_from_u64(seed.wrapping_add(0xA11C_E55E_D5A5_EED5));
+        let signs = (0..dim)
+            .map(|_| if rng.gen::<bool>() { 1.0 } else { -1.0 })
+            .collect();
+        Ok(Self { dim, seed, signs })
+    }
+
+    pub fn seed(&self) -> u64 {
+        self.seed
+    }
+}
+
+impl Rotation for FastHadamardRotation {
+    fn dim(&self) -> usize {
+        self.dim
+    }
+
+    fn apply(&self, input: &[f32], output: &mut [f32]) -> Result<()> {
+        check_dim(input.len(), self.dim)?;
+        check_dim(output.len(), self.dim)?;
+        for ((out, value), sign) in output.iter_mut().zip(input.iter()).zip(self.signs.iter()) {
+            *out = value * sign;
+        }
+        fwht_normalized(output);
+        Ok(())
+    }
+
+    fn apply_inverse(&self, input: &[f32], output: &mut [f32]) -> Result<()> {
+        check_dim(input.len(), self.dim)?;
+        check_dim(output.len(), self.dim)?;
+        output.copy_from_slice(input);
+        fwht_normalized(output);
+        for (out, sign) in output.iter_mut().zip(self.signs.iter()) {
+            *out *= sign;
+        }
+        Ok(())
+    }
 }
 
 /// A full d×d orthogonal rotation matrix generated via QR decomposition of a
@@ -84,7 +225,13 @@ impl Rotation for StoredRotation {
 
         // y = R · x  (matrix is stored column-major in nalgebra)
         for (i, out) in output.iter_mut().enumerate() {
-            *out = self.matrix.row(i).iter().zip(input).map(|(r, x)| r * x).sum();
+            *out = self
+                .matrix
+                .row(i)
+                .iter()
+                .zip(input)
+                .map(|(r, x)| r * x)
+                .sum();
         }
         Ok(())
     }
@@ -95,7 +242,13 @@ impl Rotation for StoredRotation {
 
         // x = Rᵀ · y  — for orthogonal R, R⁻¹ = Rᵀ
         for (i, out) in output.iter_mut().enumerate() {
-            *out = self.matrix.column(i).iter().zip(input).map(|(r, y)| r * y).sum();
+            *out = self
+                .matrix
+                .column(i)
+                .iter()
+                .zip(input)
+                .map(|(r, y)| r * y)
+                .sum();
         }
         Ok(())
     }
@@ -119,7 +272,9 @@ fn generate_orthogonal(dim: usize, seed: u64) -> Result<DMatrix<f32>> {
     // QR decomposition can return Q with det = -1. Fix the sign to ensure det = +1
     // (a proper rotation rather than an improper one with reflection).
     let r = qr.r();
-    let signs: Vec<f32> = (0..dim).map(|i| if r[(i, i)] >= 0.0 { 1.0 } else { -1.0 }).collect();
+    let signs: Vec<f32> = (0..dim)
+        .map(|i| if r[(i, i)] >= 0.0 { 1.0 } else { -1.0 })
+        .collect();
 
     let mut corrected = q;
     for (j, &s) in signs.iter().enumerate() {
@@ -140,6 +295,27 @@ fn check_dim(got: usize, expected: usize) -> Result<()> {
     Ok(())
 }
 
+fn fwht_normalized(values: &mut [f32]) {
+    let n = values.len();
+    let mut step = 1;
+    while step < n {
+        let block = step * 2;
+        for start in (0..n).step_by(block) {
+            for offset in 0..step {
+                let a = values[start + offset];
+                let b = values[start + offset + step];
+                values[start + offset] = a + b;
+                values[start + offset + step] = a - b;
+            }
+        }
+        step = block;
+    }
+    let scale = (n as f32).sqrt().recip();
+    for value in values {
+        *value *= scale;
+    }
+}
+
 mod matrix_serde {
     use nalgebra::DMatrix;
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -151,7 +327,10 @@ mod matrix_serde {
         data: Vec<f32>,
     }
 
-    pub fn serialize<S: Serializer>(m: &DMatrix<f32>, s: S) -> std::result::Result<S::Ok, S::Error> {
+    pub fn serialize<S: Serializer>(
+        m: &DMatrix<f32>,
+        s: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
         MatrixProxy {
             rows: m.nrows(),
             cols: m.ncols(),
@@ -160,7 +339,9 @@ mod matrix_serde {
         .serialize(s)
     }
 
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<DMatrix<f32>, D::Error> {
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> std::result::Result<DMatrix<f32>, D::Error> {
         let p = MatrixProxy::deserialize(d)?;
         Ok(DMatrix::from_vec(p.rows, p.cols, p.data))
     }

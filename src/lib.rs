@@ -1,20 +1,20 @@
 //! # turbo-quant
 //!
-//! Rust implementation of **TurboQuant**, **PolarQuant**, and **QJL** —
-//! the vector quantization algorithms from Google Research (ICLR 2026).
+//! Experimental Rust implementation of **TurboQuant**, **PolarQuant**, and
+//! **QJL** profile-defined vector quantization algorithm families.
 //!
-//! These algorithms compress high-dimensional vectors (embeddings, KV cache
-//! entries) to 3–8 bits per value with **zero accuracy loss** and
-//! **no dataset-specific calibration**.
+//! The crate creates derived compressed sidecars for high-dimensional vectors.
+//! Quality is workload-dependent and must be measured with exact fallback gates.
 //!
 //! ## Key Properties
 //!
-//! - **Data-oblivious**: no k-means training, no codebook, no calibration set.
-//!   The rotation is seeded once and works on any distribution.
+//! - **Data-oblivious codec construction**: no k-means or trained codebook is
+//!   built inside the crate. Retrieval quality still depends on the deployment
+//!   distribution, filters, and workload-specific benchmark gates.
 //! - **Deterministic**: identical `(dim, bits, seed)` always produces the same
 //!   quantizer. State can be fully reconstructed from four integers.
-//! - **Zero accuracy loss**: at 3+ bits, inner product estimates are provably
-//!   unbiased and achieve near-optimal distortion (within ~2.7× of Shannon limit).
+//! - **Measured quality**: inner product estimates are approximate and
+//!   retrieval deployments still need recall/rank gates.
 //! - **Instant indexing**: unlike Product Quantization, there is no offline
 //!   training phase. Vectors can be indexed as they arrive.
 //!
@@ -30,7 +30,7 @@
 //! let database_vector: Vec<f32> = vec![0.1; dim]; // your embedding here
 //! let query_vector: Vec<f32> = vec![0.1; dim];    // your query here
 //!
-//! // Compress the database vector (store this, not the raw f32 array).
+//! // Create a compressed sidecar for the database vector.
 //! let code = q.encode(&database_vector).unwrap();
 //!
 //! // At query time: estimate inner product without decompressing.
@@ -52,20 +52,42 @@
 //!
 //! ## References
 //!
-//! - TurboQuant: Zandieh et al., ICLR 2026
-//! - PolarQuant: Zandieh et al., AISTATS 2026
-//! - QJL: Zandieh et al., AAAI 2025
+//! - TurboQuant-style two-stage polar plus residual sketch compression.
+//! - Polar-coordinate quantization after seeded rotation.
+//! - Quantized Johnson-Lindenstrauss sign-projection sketches.
 
+pub mod baseline;
+pub mod bitpack;
+pub mod codebook;
 pub mod error;
+pub mod eval;
+pub mod index;
 pub mod kv;
+pub mod packed;
 pub mod polar;
+pub mod profile;
 pub mod qjl;
+pub mod radius;
 pub mod rotation;
 pub mod turbo;
+pub mod wire;
 
+pub use baseline::ByteAccountingV1;
+pub use codebook::ScalarCodebook;
 pub use error::{Result, TurboQuantError};
-pub use kv::{CompressedToken, KvCacheCompressor, KvCacheConfig};
-pub use polar::{PolarCode, PolarQuantizer};
-pub use qjl::{QjlQuantizer, QjlSketch};
-pub use rotation::{Rotation, StoredRotation};
-pub use turbo::{BatchStats, TurboCode, TurboQuantizer};
+pub use eval::{BenchmarkComparisonV1, BenchmarkCorpus, BenchmarkReceiptV1, CompressionEvalV1};
+pub use index::{
+    ScoredCandidate, SearchOptions, SearchReceiptV1, TurboSidecarEntry, TurboSidecarIndex,
+};
+pub use kv::{
+    AttentionScale, AttentionScoreOptions, CompressedToken, KvCacheCompressor, KvCacheConfig,
+    KvMemoryReportV1, KvQuantPolicy, KvRuntimeConfig, KvShadowScore, KvShadowToken,
+};
+pub use packed::{PackedPolarCode, PackedQjlSketch, PackedTurboCode};
+pub use polar::{PolarCode, PolarProjectedQuery, PolarQuantizer};
+pub use profile::{CodecProfileV1, CompressionPolicyV1, CompressionReceiptV1, ValidationState};
+pub use qjl::{QjlProjectedQuery, QjlQuantizer, QjlSketch, QjlSketchProvenanceV1};
+pub use radius::{CompressedRadiiV1, RadiusCodecProfileV1};
+pub use rotation::{FastHadamardRotation, Rotation, RotationBackend, RotationKind, StoredRotation};
+pub use turbo::{BatchStats, TurboCode, TurboMode, TurboProjectedQuery, TurboQuantizer};
+pub use wire::{TurboCodeWireV1, TURBO_CODE_WIRE_MAGIC};

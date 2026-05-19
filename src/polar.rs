@@ -3,7 +3,7 @@
 //! PolarQuant converts Cartesian pairs into polar form (radius, angle), then
 //! uniformly quantizes angles. Because the rotation stage whitens the data,
 //! angles are uniformly distributed on [−π, π], making uniform quantization
-//! near-optimal with no dataset-specific calibration needed.
+//! a profile-defined alternative to trained-codebook calibration.
 //!
 //! # Algorithm
 //!
@@ -12,7 +12,7 @@
 //! 1. Group into d/2 pairs: (y₀, y₁), (y₂, y₃), …
 //! 2. Convert each pair to polar: rᵢ = √(y₂ᵢ² + y₂ᵢ₊₁²), θᵢ = atan2(y₂ᵢ₊₁, y₂ᵢ)
 //! 3. Quantize each θᵢ to `bits` levels uniformly on [−π, π]
-//! 4. Store radii as f32, quantized angle indices as u16 (up to 16 bits)
+//! 4. Store radii as f32 and bitpack quantized angle indices
 //!
 //! For approximate nearest-neighbor search, exact reconstruction is not required.
 //! The inner product estimator operates directly on polar codes, avoiding
@@ -24,14 +24,15 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    bitpack,
     error::{Result, TurboQuantError},
-    rotation::{Rotation, StoredRotation},
+    rotation::{Rotation, RotationBackend, RotationKind},
 };
 
 /// A compressed representation of a single vector in polar form.
 ///
-/// The `radii` array has length d/2, and `angle_indices` has length d/2.
-/// Angle indices are in [0, 2^bits).
+/// The `radii` array has length d/2, and `angle_indices` stores d/2 logical
+/// angle indices. Angle indices are in [0, 2^bits).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct PolarCode {
     /// Original vector dimension (must be even).
@@ -50,38 +51,131 @@ impl PolarCode {
         self.dim / 2
     }
 
-    /// Reconstruct the dequantized angle for pair `i` in radians ∈ [−π, π).
-    pub fn dequantize_angle(&self, i: usize) -> f32 {
-        let levels = 1u32 << self.bits;
-        let idx = self.angle_indices[i] as f32;
-        (idx / levels as f32) * (2.0 * PI) - PI
+    /// Build a packed code from logical angle indices.
+    pub fn from_parts(
+        dim: usize,
+        bits: u8,
+        radii: Vec<f32>,
+        angle_indices: &[u16],
+    ) -> Result<Self> {
+        let code = Self {
+            dim,
+            bits,
+            radii,
+            angle_indices: angle_indices.to_vec(),
+        };
+        code.validate_for(dim, bits)?;
+        Ok(code)
     }
 
-    /// Approximate memory used by this code in bytes.
+    /// Return the logical angle index for pair `i`.
+    pub fn angle_index(&self, i: usize) -> Result<u16> {
+        if i >= self.pair_count() {
+            return Err(TurboQuantError::MalformedCode {
+                reason: format!(
+                    "angle index {i} is outside pair count {}",
+                    self.pair_count()
+                ),
+            });
+        }
+        Ok(self.angle_indices[i])
+    }
+
+    /// Unpack all logical angle indices.
+    pub fn angle_indices(&self) -> Result<Vec<u16>> {
+        self.validate_for(self.dim, self.bits)?;
+        Ok(self.angle_indices.clone())
+    }
+
+    /// Reconstruct the dequantized angle for pair `i` in radians ∈ [−π, π).
+    pub fn dequantize_angle(&self, i: usize) -> Result<f32> {
+        let levels = 1u32 << self.bits;
+        let idx = self.angle_index(i)? as f32;
+        Ok((idx / levels as f32) * (2.0 * PI) - PI)
+    }
+
+    /// Serialized payload bytes used by this code.
     pub fn encoded_bytes(&self) -> usize {
-        let n = self.pair_count();
-        n * std::mem::size_of::<f32>() + n * std::mem::size_of::<u16>()
+        self.radii.len() * std::mem::size_of::<f32>()
+            + bitpack::packed_len(self.angle_indices.len(), self.bits).unwrap_or(usize::MAX)
+    }
+
+    /// Validate this code against an expected profile.
+    pub fn validate_for(&self, dim: usize, bits: u8) -> Result<()> {
+        if self.dim != dim {
+            return Err(TurboQuantError::DimensionMismatch {
+                expected: dim,
+                got: self.dim,
+            });
+        }
+        if self.bits != bits {
+            return Err(TurboQuantError::MalformedCode {
+                reason: format!("code has bits={}, expected {bits}", self.bits),
+            });
+        }
+        if dim == 0 || dim % 2 != 0 {
+            return Err(TurboQuantError::MalformedCode {
+                reason: format!("code dimension must be positive and even, got {dim}"),
+            });
+        }
+        let pairs = dim / 2;
+        if self.radii.len() != pairs {
+            return Err(TurboQuantError::MalformedCode {
+                reason: format!("code has {} radii, expected {pairs}", self.radii.len()),
+            });
+        }
+        for (index, radius) in self.radii.iter().enumerate() {
+            if !radius.is_finite() || *radius < 0.0 {
+                return Err(TurboQuantError::MalformedCode {
+                    reason: format!("radius {index} is not finite and non-negative"),
+                });
+            }
+        }
+        if self.angle_indices.len() != pairs {
+            return Err(TurboQuantError::MalformedCode {
+                reason: format!(
+                    "code has {} angle indices, expected {pairs}",
+                    self.angle_indices.len()
+                ),
+            });
+        }
+        let levels = 1u32 << bits;
+        for (index, angle_index) in self.angle_indices.iter().enumerate() {
+            if u32::from(*angle_index) >= levels {
+                return Err(TurboQuantError::MalformedCode {
+                    reason: format!(
+                        "angle index {index} value {angle_index} is outside [0, {levels})"
+                    ),
+                });
+            }
+        }
+        Ok(())
     }
 }
 
 /// Encodes and decodes vectors using PolarQuant.
 ///
-/// The quantizer owns a [`StoredRotation`] (or any [`Rotation`] impl) that is
-/// applied before encoding. The rotation is seeded deterministically, so only
-/// `(dim, seed, bits)` need to be persisted — the rotation matrix can always
-/// be regenerated.
+/// The quantizer owns a selected rotation backend that is applied before
+/// encoding. The rotation is seeded deterministically, so the profile can
+/// record `(dim, seed, bits, rotation_kind)`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PolarQuantizer {
     dim: usize,
     bits: u8,
-    rotation: StoredRotation,
+    rotation: RotationBackend,
+}
+
+/// Query state prepared once for scoring multiple PolarQuant codes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PolarProjectedQuery {
+    rotated_query: Vec<f32>,
 }
 
 impl PolarQuantizer {
     /// Create a new quantizer for vectors of dimension `dim`.
     ///
-    /// - `bits`: angle quantization levels (1–16). 4 bits gives good recall;
-    ///   8 bits is near-lossless for typical embeddings.
+    /// - `bits`: angle quantization levels (1–16). Higher values generally
+    ///   reduce angle quantization error and increase storage.
     /// - `seed`: controls the random rotation. Identical `(dim, bits, seed)`
     ///   always produces an identical quantizer.
     pub fn new(dim: usize, bits: u8, seed: u64) -> Result<Self> {
@@ -94,8 +188,36 @@ impl PolarQuantizer {
         if bits == 0 || bits > 16 {
             return Err(TurboQuantError::InvalidBitWidth { got: bits });
         }
-        let rotation = StoredRotation::new(dim, seed)?;
-        Ok(Self { dim, bits, rotation })
+        Self::new_with_rotation(dim, bits, seed, RotationKind::Auto)
+    }
+
+    /// Create a quantizer with an explicit rotation policy.
+    pub fn new_with_rotation(
+        dim: usize,
+        bits: u8,
+        seed: u64,
+        rotation_kind: RotationKind,
+    ) -> Result<Self> {
+        if dim == 0 {
+            return Err(TurboQuantError::ZeroDimension);
+        }
+        if dim % 2 != 0 {
+            return Err(TurboQuantError::OddDimension { got: dim });
+        }
+        if bits == 0 || bits > 16 {
+            return Err(TurboQuantError::InvalidBitWidth { got: bits });
+        }
+        let rotation = RotationBackend::new(dim, seed, rotation_kind)?;
+        Ok(Self {
+            dim,
+            bits,
+            rotation,
+        })
+    }
+
+    /// Create a quantizer using dense QR reference rotation.
+    pub fn new_with_stored_rotation(dim: usize, bits: u8, seed: u64) -> Result<Self> {
+        Self::new_with_rotation(dim, bits, seed, RotationKind::StoredQr)
     }
 
     /// The vector dimension this quantizer operates on.
@@ -108,11 +230,22 @@ impl PolarQuantizer {
         self.bits
     }
 
+    /// Resolved rotation backend.
+    pub fn rotation_kind(&self) -> RotationKind {
+        self.rotation.kind()
+    }
+
+    /// Resolved rotation backend label for profiles and receipts.
+    pub fn rotation_kind_label(&self) -> &'static str {
+        self.rotation.kind_label()
+    }
+
     /// Encode a vector into a [`PolarCode`].
     ///
     /// `vector` must have length `dim`.
     pub fn encode(&self, vector: &[f32]) -> Result<PolarCode> {
         self.check_input_dim(vector.len())?;
+        check_finite_vector(vector)?;
 
         let mut rotated = vec![0.0f32; self.dim];
         self.rotation.apply(vector, &mut rotated)?;
@@ -129,12 +262,7 @@ impl PolarQuantizer {
             angle_indices.push(idx);
         }
 
-        Ok(PolarCode {
-            dim: self.dim,
-            bits: self.bits,
-            radii,
-            angle_indices,
-        })
+        PolarCode::from_parts(self.dim, self.bits, radii, &angle_indices)
     }
 
     /// Decode a [`PolarCode`] back to an approximate vector.
@@ -148,7 +276,7 @@ impl PolarQuantizer {
         let pairs = self.dim / 2;
 
         for i in 0..pairs {
-            let theta = code.dequantize_angle(i);
+            let theta = code.dequantize_angle(i)?;
             let r = code.radii[i];
             rotated[2 * i] = r * theta.cos();
             rotated[2 * i + 1] = r * theta.sin();
@@ -172,23 +300,44 @@ impl PolarQuantizer {
     ///
     /// Summing over all pairs gives the full inner product estimate.
     pub fn inner_product_estimate(&self, code: &PolarCode, query: &[f32]) -> Result<f32> {
-        self.check_input_dim(query.len())?;
-        self.validate_code(code)?;
+        let projected = self.project_query(query)?;
+        self.inner_product_estimate_with_projected_query(code, &projected)
+    }
 
+    /// Rotate a query once so it can score multiple codes without repeated allocation.
+    pub fn project_query(&self, query: &[f32]) -> Result<PolarProjectedQuery> {
+        self.check_input_dim(query.len())?;
+        check_finite_vector(query)?;
         let mut rotated_query = vec![0.0f32; self.dim];
         self.rotation.apply(query, &mut rotated_query)?;
+        check_finite_vector(&rotated_query)?;
+        Ok(PolarProjectedQuery { rotated_query })
+    }
+
+    /// Estimate inner product using a pre-rotated query.
+    pub fn inner_product_estimate_with_projected_query(
+        &self,
+        code: &PolarCode,
+        query: &PolarProjectedQuery,
+    ) -> Result<f32> {
+        self.validate_code(code)?;
 
         let pairs = self.dim / 2;
         let mut estimate = 0.0f32;
 
         for i in 0..pairs {
-            let theta = code.dequantize_angle(i);
+            let theta = code.dequantize_angle(i)?;
             let r = code.radii[i];
-            let q_a = rotated_query[2 * i];
-            let q_b = rotated_query[2 * i + 1];
+            let q_a = query.rotated_query[2 * i];
+            let q_b = query.rotated_query[2 * i + 1];
             estimate += r * (q_a * theta.cos() + q_b * theta.sin());
         }
 
+        if !estimate.is_finite() {
+            return Err(TurboQuantError::MalformedCode {
+                reason: "polar score is not finite".into(),
+            });
+        }
         Ok(estimate)
     }
 
@@ -217,28 +366,19 @@ impl PolarQuantizer {
     }
 
     fn validate_code(&self, code: &PolarCode) -> Result<()> {
-        if code.dim != self.dim {
-            return Err(TurboQuantError::DimensionMismatch {
-                expected: self.dim,
-                got: code.dim,
-            });
-        }
-        if code.bits != self.bits {
-            return Err(TurboQuantError::MalformedCode {
-                reason: format!(
-                    "code has bits={}, quantizer has bits={}",
-                    code.bits, self.bits
-                ),
-            });
-        }
-        let pairs = self.dim / 2;
-        if code.radii.len() != pairs || code.angle_indices.len() != pairs {
-            return Err(TurboQuantError::MalformedCode {
-                reason: "radii or angle_indices length mismatch".into(),
-            });
-        }
-        Ok(())
+        code.validate_for(self.dim, self.bits)
     }
+}
+
+fn check_finite_vector(vector: &[f32]) -> Result<()> {
+    if let Some((index, _)) = vector
+        .iter()
+        .enumerate()
+        .find(|(_, value)| !value.is_finite())
+    {
+        return Err(TurboQuantError::NonFiniteInput { index });
+    }
+    Ok(())
 }
 
 /// Encode a Cartesian pair (a, b) into (radius, quantized_angle_index).

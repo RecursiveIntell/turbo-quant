@@ -1,0 +1,14 @@
+//! Template only. Codex must replace this after inspecting semantic-memory APIs.
+//!
+//! Required behavior:
+//! - load/build semantic-memory fixture or corpus
+//! - get raw vectors and stable IDs through semantic-memory canonical APIs
+//! - build turbo-quant sidecars
+//! - run sidecar candidate search
+//! - exact-rerank candidates using semantic-memory/raw vectors
+//! - emit SemanticMemoryProofReceiptV1 JSON
+
+fn main() {
+    eprintln!("Replace this template with a real harness after semantic-memory API inspection.");
+    std::process::exit(2);
+}

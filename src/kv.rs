@@ -3,33 +3,28 @@
 //! In a decoder-only transformer, the KV cache stores one key/value pair per
 //! token per layer. With long context windows this dominates GPU memory.
 //!
-//! [`KvCacheCompressor`] provides an online interface: call [`compress_token`]
-//! as each token is generated, then [`attention_scores`] to compute the full
-//! attention logit vector against all stored compressed keys — without
-//! decompressing them.
+//! [`KvCacheCompressor`] provides an experimental online shadow-mode interface:
+//! call [`KvCacheCompressor::compress_token`] as each token is generated, then
+//! [`KvCacheCompressor::attention_scores`] to compute attention logits from the
+//! selected key policy.
 //!
-//! # Memory Savings
-//!
-//! At 8 bits with d=128 (typical per-head dimension):
-//! - Uncompressed key: 128 × 4 bytes = 512 bytes
-//! - TurboCode key:   64 × 4 (radii) + 64 × 2 (angle indices) + 32 × 1 (QJL signs)
-//!               =   256 + 128 + 32 = 416 bytes
-//!
-//! At 4 bits the savings are more dramatic. Values are compressed identically.
+//! Exact shadows can be retained for fallback and comparison. This module does
+//! not validate deployed attention quality.
 //!
 //! # Usage
 //!
 //! ```rust
-//! use turbo_quant::kv::{KvCacheCompressor, KvCacheConfig};
+//! use turbo_quant::kv::{KvCacheCompressor, KvRuntimeConfig, KvQuantPolicy};
 //!
-//! let config = KvCacheConfig {
+//! let config = KvRuntimeConfig {
 //!     head_dim: 64,        // per-attention-head dimension
-//!     bits: 8,             // bit budget for keys and values
-//!     projections: 16,     // QJL sketch projections
+//!     key_policy: KvQuantPolicy::quantized(8, 16),
+//!     value_policy: KvQuantPolicy::Exact,
 //!     seed: 42,
+//!     keep_exact_shadow: true,
 //! };
 //!
-//! let mut cache = KvCacheCompressor::new(config).unwrap();
+//! let mut cache = KvCacheCompressor::new_runtime(config).unwrap();
 //!
 //! // At each generation step, compress the new key and value.
 //! let key = vec![0.1f32; 64];
@@ -51,28 +46,142 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     error::{Result, TurboQuantError},
-    turbo::{TurboCode, TurboQuantizer},
+    rotation::RotationKind,
+    turbo::{TurboCode, TurboMode, TurboQuantizer},
 };
 
-/// Configuration for a single attention head's KV cache compressor.
+/// Quantization policy for one KV stream.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum KvQuantPolicy {
+    /// Keep exact f32 vectors and do not create a compressed sidecar.
+    Exact,
+    /// Create TurboQuant sidecars. Callers should benchmark before promoting.
+    Quantized {
+        bits: u8,
+        projections: usize,
+        mode: TurboMode,
+        rotation_kind: RotationKind,
+    },
+}
+
+impl KvQuantPolicy {
+    pub fn quantized(bits: u8, projections: usize) -> Self {
+        Self::Quantized {
+            bits,
+            projections,
+            mode: TurboMode::PolarWithQjl,
+            rotation_kind: RotationKind::Auto,
+        }
+    }
+
+    pub fn quantized_with_stored_rotation(bits: u8, projections: usize) -> Self {
+        Self::Quantized {
+            bits,
+            projections,
+            mode: TurboMode::PolarWithQjl,
+            rotation_kind: RotationKind::StoredQr,
+        }
+    }
+}
+
+/// Legacy configuration for a single attention head's KV cache compressor.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct KvCacheConfig {
     /// Dimension of each attention head's key/value vectors.
     pub head_dim: usize,
-    /// Bit budget per scalar value (2–16). 8 gives near-lossless recall.
+    /// Legacy symmetric TurboQuant bit budget.
     pub bits: u8,
-    /// Number of QJL projections for the residual sketch.
-    /// Rule of thumb: `head_dim / 4`.
+    /// Legacy symmetric QJL projection count.
     pub projections: usize,
     /// Deterministic seed for all random matrices.
     pub seed: u64,
 }
 
-/// A compressed KV cache entry for one token.
+/// Runtime configuration for shadow-mode KV experiments.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct KvRuntimeConfig {
+    /// Dimension of each attention head's key/value vectors.
+    pub head_dim: usize,
+    /// Key compression policy.
+    pub key_policy: KvQuantPolicy,
+    /// Value compression policy. Values may need a different policy from keys.
+    pub value_policy: KvQuantPolicy,
+    /// Deterministic seed for all random matrices.
+    pub seed: u64,
+    /// Keep exact keys/values so callers can run fallback and shadow comparison.
+    pub keep_exact_shadow: bool,
+}
+
+impl From<KvCacheConfig> for KvRuntimeConfig {
+    fn from(config: KvCacheConfig) -> Self {
+        Self {
+            head_dim: config.head_dim,
+            key_policy: KvQuantPolicy::quantized(config.bits, config.projections),
+            value_policy: KvQuantPolicy::quantized(config.bits, config.projections),
+            seed: config.seed,
+            keep_exact_shadow: true,
+        }
+    }
+}
+
+/// Legacy compressed KV cache entry for one token.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct CompressedToken {
     pub compressed_key: TurboCode,
     pub compressed_value: TurboCode,
+}
+
+/// Runtime shadow entry for one token.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct KvShadowToken {
+    pub compressed_key: Option<TurboCode>,
+    pub compressed_value: Option<TurboCode>,
+    pub exact_key: Option<Vec<f32>>,
+    pub exact_value: Option<Vec<f32>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct KvShadowScore {
+    pub exact: f32,
+    pub compressed: f32,
+    pub abs_error: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub enum AttentionScale {
+    None,
+    ByHeadDim,
+    Custom(f32),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct AttentionScoreOptions {
+    pub scale: AttentionScale,
+}
+
+impl Default for AttentionScoreOptions {
+    fn default() -> Self {
+        Self {
+            scale: AttentionScale::None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct KvMemoryReportV1 {
+    pub schema: String,
+    pub token_count: usize,
+    pub head_dim: usize,
+    pub compressed_key_bytes: usize,
+    pub compressed_value_bytes: usize,
+    pub exact_shadow_key_bytes: usize,
+    pub exact_shadow_value_bytes: usize,
+    pub raw_fp32_baseline_bytes: usize,
+    pub fp16_baseline_bytes: usize,
+    pub resident_bytes: usize,
+    pub sidecar_only_bytes: usize,
+    pub warnings: Vec<String>,
 }
 
 /// Online KV cache compressor for one attention head.
@@ -81,27 +190,26 @@ pub struct CompressedToken {
 /// across all stored compressed keys without decompression.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KvCacheCompressor {
-    config: KvCacheConfig,
-    key_quantizer: TurboQuantizer,
-    value_quantizer: TurboQuantizer,
-    tokens: Vec<CompressedToken>,
+    config: KvRuntimeConfig,
+    key_quantizer: Option<TurboQuantizer>,
+    value_quantizer: Option<TurboQuantizer>,
+    tokens: Vec<KvShadowToken>,
 }
 
 impl KvCacheCompressor {
     /// Create a new compressor for one attention head.
     pub fn new(config: KvCacheConfig) -> Result<Self> {
-        let key_quantizer = TurboQuantizer::new(
-            config.head_dim,
-            config.bits,
-            config.projections,
-            config.seed,
-        )?;
+        Self::new_runtime(config.into())
+    }
+
+    /// Create a new compressor from explicit runtime policies.
+    pub fn new_runtime(config: KvRuntimeConfig) -> Result<Self> {
+        let key_quantizer = quantizer_for_policy(config.head_dim, &config.key_policy, config.seed)?;
         // Value quantizer uses an independent seed offset so key and value
         // rotation matrices are uncorrelated.
-        let value_quantizer = TurboQuantizer::new(
+        let value_quantizer = quantizer_for_policy(
             config.head_dim,
-            config.bits,
-            config.projections,
+            &config.value_policy,
             config.seed.wrapping_add(0x1234_5678_ABCD_EF00),
         )?;
         Ok(Self {
@@ -139,9 +247,22 @@ impl KvCacheCompressor {
             });
         }
 
-        let compressed_key = self.key_quantizer.encode(key)?;
-        let compressed_value = self.value_quantizer.encode(value)?;
-        self.tokens.push(CompressedToken { compressed_key, compressed_value });
+        let compressed_key = self
+            .key_quantizer
+            .as_ref()
+            .map(|quantizer| quantizer.encode(key))
+            .transpose()?;
+        let compressed_value = self
+            .value_quantizer
+            .as_ref()
+            .map(|quantizer| quantizer.encode(value))
+            .transpose()?;
+        self.tokens.push(KvShadowToken {
+            compressed_key,
+            compressed_value,
+            exact_key: self.config.keep_exact_shadow.then(|| key.to_vec()),
+            exact_value: self.config.keep_exact_shadow.then(|| value.to_vec()),
+        });
         Ok(())
     }
 
@@ -152,6 +273,15 @@ impl KvCacheCompressor {
     ///
     /// O(n·d) time where n is the number of stored tokens.
     pub fn attention_scores(&self, query: &[f32]) -> Result<Vec<f32>> {
+        self.attention_scores_with_options(query, AttentionScoreOptions::default())
+    }
+
+    /// Compute attention logits with optional transformer-style scaling.
+    pub fn attention_scores_with_options(
+        &self,
+        query: &[f32],
+        options: AttentionScoreOptions,
+    ) -> Result<Vec<f32>> {
         if query.len() != self.config.head_dim {
             return Err(TurboQuantError::DimensionMismatch {
                 expected: self.config.head_dim,
@@ -159,10 +289,77 @@ impl KvCacheCompressor {
             });
         }
 
+        let mut scores: Vec<f32> = match &self.key_quantizer {
+            Some(quantizer) => self
+                .tokens
+                .iter()
+                .map(|t| {
+                    let code = t.compressed_key.as_ref().ok_or_else(|| {
+                        TurboQuantError::MalformedCode {
+                            reason: "token is missing compressed key".into(),
+                        }
+                    })?;
+                    quantizer.inner_product_estimate(code, query)
+                })
+                .collect(),
+            None => self.exact_attention_scores(query),
+        }?;
+        let scale = match options.scale {
+            AttentionScale::None => 1.0,
+            AttentionScale::ByHeadDim => 1.0 / (self.config.head_dim as f32).sqrt(),
+            AttentionScale::Custom(value) => value,
+        };
+        if !scale.is_finite() {
+            return Err(TurboQuantError::MalformedCode {
+                reason: "attention scale is not finite".into(),
+            });
+        }
+        for score in &mut scores {
+            *score *= scale;
+        }
+        Ok(scores)
+    }
+
+    /// Exact f32 attention logits from the retained shadow vectors.
+    pub fn exact_attention_scores(&self, query: &[f32]) -> Result<Vec<f32>> {
+        if query.len() != self.config.head_dim {
+            return Err(TurboQuantError::DimensionMismatch {
+                expected: self.config.head_dim,
+                got: query.len(),
+            });
+        }
         self.tokens
             .iter()
-            .map(|t| self.key_quantizer.inner_product_estimate(&t.compressed_key, query))
+            .map(|token| {
+                let key =
+                    token
+                        .exact_key
+                        .as_ref()
+                        .ok_or_else(|| TurboQuantError::MalformedCode {
+                            reason: "exact key fallback unavailable; enable keep_exact_shadow"
+                                .into(),
+                        })?;
+                Ok(key.iter().zip(query.iter()).map(|(k, q)| k * q).sum())
+            })
             .collect()
+    }
+
+    /// Compare exact and compressed key scores when exact shadows are retained.
+    pub fn shadow_attention_scores(&self, query: &[f32]) -> Result<Vec<KvShadowScore>> {
+        let exact = self.exact_attention_scores(query)?;
+        let compressed = match &self.key_quantizer {
+            Some(_) => self.attention_scores(query)?,
+            None => exact.clone(),
+        };
+        Ok(exact
+            .into_iter()
+            .zip(compressed)
+            .map(|(exact, compressed)| KvShadowScore {
+                exact,
+                compressed,
+                abs_error: (exact - compressed).abs(),
+            })
+            .collect())
     }
 
     /// Softmax-weighted sum of approximate value reconstructions.
@@ -191,7 +388,19 @@ impl KvCacheCompressor {
         // Weighted sum of decoded values.
         let mut output = vec![0.0f32; self.config.head_dim];
         for (token, &weight) in self.tokens.iter().zip(weights.iter()) {
-            let decoded = self.value_quantizer.decode_approximate(&token.compressed_value)?;
+            let decoded = match (
+                &self.value_quantizer,
+                &token.compressed_value,
+                &token.exact_value,
+            ) {
+                (Some(quantizer), Some(code), _) => quantizer.decode_approximate(code)?,
+                (None, _, Some(exact)) => exact.clone(),
+                _ => {
+                    return Err(TurboQuantError::MalformedCode {
+                        reason: "value fallback unavailable".into(),
+                    });
+                }
+            };
             for (out, val) in output.iter_mut().zip(decoded.iter()) {
                 *out += weight * val;
             }
@@ -211,17 +420,34 @@ impl KvCacheCompressor {
                         got: i + 1,
                     });
                 }
-                self.value_quantizer
-                    .decode_approximate(&self.tokens[i].compressed_value)
+                match (
+                    &self.value_quantizer,
+                    &self.tokens[i].compressed_value,
+                    &self.tokens[i].exact_value,
+                ) {
+                    (Some(quantizer), Some(code), _) => quantizer.decode_approximate(code),
+                    (None, _, Some(exact)) => Ok(exact.clone()),
+                    _ => Err(TurboQuantError::MalformedCode {
+                        reason: "value fallback unavailable".into(),
+                    }),
+                }
             })
             .collect()
     }
 
     /// Approximate total bytes used by all compressed tokens.
     pub fn compressed_bytes(&self) -> usize {
-        self.tokens.iter().map(|t| {
-            t.compressed_key.encoded_bytes() + t.compressed_value.encoded_bytes()
-        }).sum()
+        self.tokens
+            .iter()
+            .map(|t| {
+                t.compressed_key
+                    .as_ref()
+                    .map_or(0, TurboCode::encoded_bytes)
+                    + t.compressed_value
+                        .as_ref()
+                        .map_or(0, TurboCode::encoded_bytes)
+            })
+            .sum()
     }
 
     /// Bytes that would be used if keys/values were stored uncompressed as f32.
@@ -236,6 +462,84 @@ impl KvCacheCompressor {
             return 0.0;
         }
         self.uncompressed_bytes() as f32 / compressed as f32
+    }
+
+    /// Honest memory accounting for compressed sidecars plus retained shadows.
+    pub fn memory_report(&self) -> KvMemoryReportV1 {
+        let compressed_key_bytes: usize = self
+            .tokens
+            .iter()
+            .map(|token| {
+                token
+                    .compressed_key
+                    .as_ref()
+                    .map_or(0, TurboCode::encoded_bytes)
+            })
+            .sum();
+        let compressed_value_bytes: usize = self
+            .tokens
+            .iter()
+            .map(|token| {
+                token
+                    .compressed_value
+                    .as_ref()
+                    .map_or(0, TurboCode::encoded_bytes)
+            })
+            .sum();
+        let exact_shadow_key_bytes: usize = self
+            .tokens
+            .iter()
+            .map(|token| token.exact_key.as_ref().map_or(0, |v| v.len() * 4))
+            .sum();
+        let exact_shadow_value_bytes: usize = self
+            .tokens
+            .iter()
+            .map(|token| token.exact_value.as_ref().map_or(0, |v| v.len() * 4))
+            .sum();
+        let raw_fp32_baseline_bytes = self.uncompressed_bytes();
+        let fp16_baseline_bytes = self.tokens.len() * 2 * self.config.head_dim * 2;
+        let sidecar_only_bytes = compressed_key_bytes + compressed_value_bytes;
+        let resident_bytes = sidecar_only_bytes + exact_shadow_key_bytes + exact_shadow_value_bytes;
+        KvMemoryReportV1 {
+            schema: "KvMemoryReportV1".into(),
+            token_count: self.tokens.len(),
+            head_dim: self.config.head_dim,
+            compressed_key_bytes,
+            compressed_value_bytes,
+            exact_shadow_key_bytes,
+            exact_shadow_value_bytes,
+            raw_fp32_baseline_bytes,
+            fp16_baseline_bytes,
+            resident_bytes,
+            sidecar_only_bytes,
+            warnings: vec![
+                "resident bytes include retained exact shadows; do not report sidecar-only bytes as runtime savings".into(),
+            ],
+        }
+    }
+}
+
+fn quantizer_for_policy(
+    head_dim: usize,
+    policy: &KvQuantPolicy,
+    seed: u64,
+) -> Result<Option<TurboQuantizer>> {
+    match policy {
+        KvQuantPolicy::Exact => Ok(None),
+        KvQuantPolicy::Quantized {
+            bits,
+            projections,
+            mode,
+            rotation_kind,
+        } => TurboQuantizer::new_with_mode_and_rotation(
+            head_dim,
+            *bits,
+            *projections,
+            seed,
+            *mode,
+            *rotation_kind,
+        )
+        .map(Some),
     }
 }
 
@@ -257,7 +561,8 @@ mod tests {
             bits: 8,
             projections: dim / 4,
             seed: 42,
-        }).unwrap()
+        })
+        .unwrap()
     }
 
     #[test]
@@ -271,7 +576,9 @@ mod tests {
     fn token_count_increments_correctly() {
         let mut cache = make_cache(16);
         for i in 0..5 {
-            cache.compress_token(&random_vec(16, i), &random_vec(16, i + 100)).unwrap();
+            cache
+                .compress_token(&random_vec(16, i), &random_vec(16, i + 100))
+                .unwrap();
         }
         assert_eq!(cache.len(), 5);
     }
@@ -280,7 +587,9 @@ mod tests {
     fn attention_scores_length_matches_token_count() {
         let mut cache = make_cache(16);
         for i in 0..10 {
-            cache.compress_token(&random_vec(16, i), &random_vec(16, i + 100)).unwrap();
+            cache
+                .compress_token(&random_vec(16, i), &random_vec(16, i + 100))
+                .unwrap();
         }
         let scores = cache.attention_scores(&random_vec(16, 999)).unwrap();
         assert_eq!(scores.len(), 10);
@@ -293,13 +602,17 @@ mod tests {
 
         // Add 9 random keys.
         for i in 0..9u64 {
-            cache.compress_token(&random_vec(dim, i * 10), &random_vec(dim, i * 10 + 1)).unwrap();
+            cache
+                .compress_token(&random_vec(dim, i * 10), &random_vec(dim, i * 10 + 1))
+                .unwrap();
         }
 
         // Add one key that is very close to the query.
         let query = random_vec(dim, 999);
         let similar_key: Vec<f32> = query.iter().map(|x| x + 0.001).collect();
-        cache.compress_token(&similar_key, &random_vec(dim, 9000)).unwrap();
+        cache
+            .compress_token(&similar_key, &random_vec(dim, 9000))
+            .unwrap();
 
         let scores = cache.attention_scores(&query).unwrap();
         let best_idx = scores
@@ -309,7 +622,10 @@ mod tests {
             .map(|(i, _)| i)
             .unwrap();
 
-        assert_eq!(best_idx, 9, "similar key should have highest attention score");
+        assert_eq!(
+            best_idx, 9,
+            "similar key should have highest attention score"
+        );
     }
 
     #[test]
@@ -317,7 +633,9 @@ mod tests {
         let dim = 16;
         let mut cache = make_cache(dim);
         for i in 0..5u64 {
-            cache.compress_token(&random_vec(dim, i), &random_vec(dim, i + 50)).unwrap();
+            cache
+                .compress_token(&random_vec(dim, i), &random_vec(dim, i + 50))
+                .unwrap();
         }
         let output = cache.attend(&random_vec(dim, 1)).unwrap();
         assert_eq!(output.len(), dim);
@@ -337,19 +655,33 @@ mod tests {
         let output = cache.attend(&random_vec(dim, 1)).unwrap();
 
         // Output should be close to v since all values are the same.
-        let error: f32 = output.iter().zip(v.iter()).map(|(o, vi)| (o - vi).powi(2)).sum::<f32>().sqrt();
+        let error: f32 = output
+            .iter()
+            .zip(v.iter())
+            .map(|(o, vi)| (o - vi).powi(2))
+            .sum::<f32>()
+            .sqrt();
         let v_norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-        assert!(error / v_norm < 0.15, "attend output too far from value: relative_error={:.4}", error / v_norm);
+        assert!(
+            error / v_norm < 0.15,
+            "attend output too far from value: relative_error={:.4}",
+            error / v_norm
+        );
     }
 
     #[test]
     fn compression_ratio_is_above_one() {
         let mut cache = make_cache(64);
         for i in 0..20u64 {
-            cache.compress_token(&random_vec(64, i), &random_vec(64, i + 1000)).unwrap();
+            cache
+                .compress_token(&random_vec(64, i), &random_vec(64, i + 1000))
+                .unwrap();
         }
         let ratio = cache.compression_ratio();
-        assert!(ratio > 1.0, "compression ratio should be > 1, got {ratio:.2}");
+        assert!(
+            ratio > 1.0,
+            "compression ratio should be > 1, got {ratio:.2}"
+        );
         println!("compression ratio at 8 bits, d=64: {ratio:.2}x");
     }
 
@@ -363,7 +695,9 @@ mod tests {
     #[test]
     fn wrong_query_dimension_is_rejected() {
         let mut cache = make_cache(16);
-        cache.compress_token(&random_vec(16, 0), &random_vec(16, 1)).unwrap();
+        cache
+            .compress_token(&random_vec(16, 0), &random_vec(16, 1))
+            .unwrap();
         let result = cache.attention_scores(&random_vec(8, 0));
         assert!(result.is_err());
     }
@@ -379,9 +713,46 @@ mod tests {
         let token = &cache.tokens[0];
         // Different rotation seeds → different angle indices with overwhelming probability.
         assert_ne!(
-            token.compressed_key.polar_code.angle_indices,
-            token.compressed_value.polar_code.angle_indices,
+            token
+                .compressed_key
+                .as_ref()
+                .unwrap()
+                .polar_code
+                .angle_indices,
+            token
+                .compressed_value
+                .as_ref()
+                .unwrap()
+                .polar_code
+                .angle_indices,
             "key and value quantizers should use independent rotations"
         );
+    }
+
+    #[test]
+    fn exact_shadow_scores_are_available() {
+        let mut cache = make_cache(16);
+        cache
+            .compress_token(&random_vec(16, 1), &random_vec(16, 2))
+            .unwrap();
+        let shadow = cache.shadow_attention_scores(&random_vec(16, 3)).unwrap();
+        assert_eq!(shadow.len(), 1);
+        assert!(shadow[0].abs_error.is_finite());
+    }
+
+    #[test]
+    fn asymmetric_exact_value_policy_decodes_exact_values() {
+        let dim = 16;
+        let mut cache = KvCacheCompressor::new_runtime(KvRuntimeConfig {
+            head_dim: dim,
+            key_policy: KvQuantPolicy::quantized(8, dim / 4),
+            value_policy: KvQuantPolicy::Exact,
+            seed: 42,
+            keep_exact_shadow: true,
+        })
+        .unwrap();
+        let value = random_vec(dim, 99);
+        cache.compress_token(&random_vec(dim, 1), &value).unwrap();
+        assert_eq!(cache.decode_values(&[0]).unwrap()[0], value);
     }
 }
