@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TurboQuantCratesIoReleaseReceiptV1",
+  "type": "object",
+  "required": [
+    "schema",
+    "crate",
+    "target_version",
+    "recommendation",
+    "commands",
+    "blockers"
+  ],
+  "properties": {
+    "schema": {
+      "const": "TurboQuantCratesIoReleaseReceiptV1"
+    },
+    "crate": {
+      "const": "turbo-quant"
+    },
+    "target_version": {
+      "type": "string"
+    },
+    "recommendation": {
+      "enum": [
+        "publish",
+        "do_not_publish"
+      ]
+    },
+    "commands": {
+      "type": "array"
+    },
+    "blockers": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "publish_command_executed": {
+      "type": "boolean"
+    }
+  }
+}

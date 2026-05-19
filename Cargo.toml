@@ -10,13 +10,16 @@ keywords = ["quantization", "vector-search", "compression", "embeddings", "machi
 categories = ["science", "algorithms", "compression", "mathematics"]
 exclude = [
     ".codex/",
+    ".github/",
     ".gitignore",
     "0*_*.md",
     "0*_*.sh",
     "0*_*.json",
     "AGENTS.md",
+    "AGENTS.release.md",
     "OPERATOR_CHECKLIST.md",
     "P26_EXECUTION_BUNDLE.md",
+    "codex/",
     "prompts/",
     "docs/codex-runs/",
     "docs/release-evidence/",

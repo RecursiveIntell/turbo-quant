@@ -1,0 +1,34 @@
+name: turbo-quant release gate
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'README.md'
+      - 'src/**'
+      - 'tests/**'
+      - 'examples/**'
+      - 'benches/**'
+      - 'scripts/tq_*.py'
+      - 'docs/release/**'
+
+jobs:
+  release-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Install cargo-semver-checks
+        run: cargo install cargo-semver-checks --locked
+      - name: Run turbo-quant release gate
+        run: python3 scripts/tq_release_gate.py --version 0.2.0 --skip-harness
+      - name: Upload release evidence
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: turbo-quant-release-evidence
+          path: docs/release-evidence/v0.2.0/
