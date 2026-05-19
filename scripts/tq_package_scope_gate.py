@@ -26,6 +26,7 @@ FORBIDDEN_SUFFIXES = [
     ".zip", ".7z", ".tar", ".tar.gz", ".log", ".codex-archive.json", ".manifest.json", ".findings.json", ".excluded.json", ".report.md"
 ]
 ALLOWED_ROOTS = {
+    ".cargo_vcs_info.json",
     "Cargo.toml",
     "Cargo.toml.orig",
     "Cargo.lock",
