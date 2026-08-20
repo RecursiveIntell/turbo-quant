@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 340" role="img" aria-labelledby="title desc">
+  <title id="title">turbo-quant sidecar retrieval flow</title>
+  <desc id="desc">Exact vectors remain canonical while turbo-quant builds a compressed sidecar, generates approximate candidates, and requires exact reranking before a result is promoted.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" x2="1"><stop stop-color="#07111f"/><stop offset="1" stop-color="#111b31"/></linearGradient>
+    <filter id="glow"><feGaussianBlur stdDeviation="5" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+    <marker id="blue" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L0,6 L9,3 z" fill="#62d7ff"/></marker>
+    <marker id="amber" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L0,6 L9,3 z" fill="#ffc266"/></marker>
+  </defs>
+  <rect width="1200" height="340" rx="24" fill="url(#bg)"/>
+  <g fill="none" stroke="#17304a" opacity=".5"><path d="M0 70H1200M0 140H1200M0 210H1200M0 280H1200"/><path d="M80 0V340M220 0V340M360 0V340M500 0V340M640 0V340M780 0V340M920 0V340M1060 0V340"/></g>
+  <g font-family="ui-monospace, SFMono-Regular, Menlo, monospace" text-anchor="middle">
+    <g filter="url(#glow)"><rect x="45" y="105" width="185" height="110" rx="14" fill="#162b4a" stroke="#62d7ff" stroke-width="2"/><text x="137" y="142" fill="#dff8ff" font-size="18">Exact vectors</text><text x="137" y="170" fill="#8aa7bf" font-size="13">canonical source</text><text x="137" y="190" fill="#8aa7bf" font-size="13">keep for fallback</text></g>
+    <g filter="url(#glow)"><rect x="300" y="80" width="205" height="160" rx="14" fill="#261c4b" stroke="#b38cff" stroke-width="2"/><text x="402" y="118" fill="#f0e9ff" font-size="18">Sidecar codec</text><text x="402" y="148" fill="#c6b5ef" font-size="13">PolarQuant</text><text x="402" y="170" fill="#c6b5ef" font-size="13">TurboQuant + QJL</text><text x="402" y="192" fill="#c6b5ef" font-size="13">packed wire format</text><text x="402" y="214" fill="#c6b5ef" font-size="13">receipts / profiles</text></g>
+    <g filter="url(#glow)"><rect x="580" y="105" width="185" height="110" rx="14" fill="#103d3d" stroke="#63e6be" stroke-width="2"/><text x="672" y="142" fill="#e1fff5" font-size="18">Candidates</text><text x="672" y="170" fill="#9ce8d0" font-size="13">approximate score</text><text x="672" y="190" fill="#9ce8d0" font-size="13">oversample + top-k</text></g>
+    <g filter="url(#glow)"><rect x="840" y="80" width="190" height="160" rx="14" fill="#493117" stroke="#ffc266" stroke-width="2"/><text x="935" y="118" fill="#fff3dd" font-size="18">Exact rerank</text><text x="935" y="148" fill="#f2c98e" font-size="13">caller-owned vectors</text><text x="935" y="170" fill="#f2c98e" font-size="13">raw scorer</text><text x="935" y="192" fill="#f2c98e" font-size="13">workload receipt</text><text x="935" y="214" fill="#f2c98e" font-size="13">promotion decision</text></g>
+    <g filter="url(#glow)"><rect x="1080" y="105" width="85" height="110" rx="14" fill="#162b4a" stroke="#62d7ff" stroke-width="2"/><text x="1122" y="151" fill="#dff8ff" font-size="16">Result</text><text x="1122" y="178" fill="#8aa7bf" font-size="12">bounded</text></g>
+  </g>
+  <g stroke="#62d7ff" stroke-width="3" marker-end="url(#blue)"><path d="M230 160H295"/><path d="M505 160H575"/><path d="M765 160H835"/></g>
+  <path d="M230 185 C400 310 790 310 930 225" fill="none" stroke="#ffc266" stroke-width="3" stroke-dasharray="9 8" marker-end="url(#amber)"/>
+  <text x="600" y="310" fill="#8aa7bf" font-family="ui-monospace, monospace" font-size="14" text-anchor="middle">approximate candidates are not ground truth • exact fallback is part of the safe integration path</text>
+</svg>

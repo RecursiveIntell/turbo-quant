@@ -35,6 +35,30 @@ use crate::{
     error::{Result, TurboQuantError},
 };
 
+// C FFI: hot paths replaced by c-kernels/qjl.c.
+// Rust originals archived in src/archive/qjl_rust.rs
+extern "C" {
+    fn tq_qjl_sketch(
+        vector: *const f32,
+        dim: usize,
+        proj_matrix: *const f32,
+        projections: usize,
+        out_signs: *mut i8,
+    );
+    fn tq_qjl_ip_estimate(
+        sketch_signs: *const i8,
+        projections: usize,
+        projected_query: *const f32,
+    ) -> f32;
+    fn tq_qjl_project_query(
+        query: *const f32,
+        dim: usize,
+        proj_matrix: *const f32,
+        projections: usize,
+        out_projected: *mut f32,
+    );
+}
+
 /// A QJL sketch: the sign of each random projection.
 ///
 /// At query time the caller must have access to the same projection matrix
@@ -209,11 +233,18 @@ impl QjlQuantizer {
         }
         check_finite_vector(vector)?;
 
-        let mut signs = Vec::with_capacity(self.projections);
+        let mut signs = vec![0i8; self.projections];
 
-        for row in self.projection_matrix.chunks_exact(self.dim) {
-            let dot: f32 = row.iter().zip(vector.iter()).map(|(g, x)| g * x).sum();
-            signs.push(if dot >= 0.0 { 1i8 } else { -1i8 });
+        // SAFETY: vector and projection_matrix are valid slices with correct
+        // lengths; signs has exactly `projections` elements.
+        unsafe {
+            tq_qjl_sketch(
+                vector.as_ptr(),
+                self.dim,
+                self.projection_matrix.as_ptr(),
+                self.projections,
+                signs.as_mut_ptr(),
+            );
         }
 
         QjlSketch::from_parts(self.dim, self.projections, &signs)
@@ -272,11 +303,20 @@ impl QjlQuantizer {
         }
         check_finite_vector(query)?;
 
-        let projected = self
-            .projection_matrix
-            .chunks_exact(self.dim)
-            .map(|row| row.iter().zip(query.iter()).map(|(g, q)| g * q).sum())
-            .collect::<Vec<f32>>();
+        let mut projected = vec![0.0f32; self.projections];
+
+        // SAFETY: query and projection_matrix are valid slices with correct
+        // lengths; projected has exactly `projections` elements.
+        unsafe {
+            tq_qjl_project_query(
+                query.as_ptr(),
+                self.dim,
+                self.projection_matrix.as_ptr(),
+                self.projections,
+                projected.as_mut_ptr(),
+            );
+        }
+
         check_finite_vector(&projected)?;
         Ok(QjlProjectedQuery { projected })
     }
@@ -313,12 +353,11 @@ impl QjlQuantizer {
         let scale = (PI / 2.0).sqrt() * source_norm / m;
 
         let signs = sketch.signs()?;
-        let estimate: f32 = query
-            .projected
-            .iter()
-            .zip(signs.iter())
-            .map(|(g_dot_query, &sign)| sign as f32 * g_dot_query)
-            .sum();
+
+        // SAFETY: signs and query.projected have exactly `projections` elements.
+        let estimate: f32 = unsafe {
+            tq_qjl_ip_estimate(signs.as_ptr(), self.projections, query.projected.as_ptr())
+        };
 
         let score = scale * estimate;
         if !score.is_finite() {

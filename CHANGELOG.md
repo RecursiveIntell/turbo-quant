@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.2.3
+
+- Added C kernels for FWHT (2.75× speedup), polar encode/decode, and
+  QJL sketch/project/IP estimate, compiled at build time via `cc` crate
+  with `-O3 -mavx2 -mfma`.
+- Bitpack C kernel reverted to Rust — FFI call overhead negated the
+  compiler advantage for branch-heavy bit manipulation.
+- Original Rust implementations preserved in `src/archive/` with
+  headers.
+- Added `build.rs` and `cc` build dependency.
+- `real_bench.rs` example added for real-embedding benchmark with
+  semantic-memory harness.
+- 123 tests pass.
+
 ## 0.2.0
 
 - Preserved the `0.1.0` public struct literal shapes for legacy code.

@@ -18,8 +18,6 @@
 //! The inner product estimator operates directly on polar codes, avoiding
 //! the decode round-trip entirely.
 
-use std::f32::consts::PI;
-
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -28,6 +26,13 @@ use crate::{
     error::{Result, TurboQuantError},
     rotation::{Rotation, RotationBackend, RotationKind},
 };
+
+// C FFI: hot paths replaced by c-kernels/polar.c.
+// Rust originals archived in src/archive/polar_rust.rs
+extern "C" {
+    fn tq_polar_encode_pair(a: f32, b: f32, bits: u8, out_radius: *mut f32, out_index: *mut u16);
+    fn tq_polar_dequantize_angle(angle_index: u16, bits: u8) -> f32;
+}
 
 /// A compressed representation of a single vector in polar form.
 ///
@@ -89,9 +94,9 @@ impl PolarCode {
 
     /// Reconstruct the dequantized angle for pair `i` in radians ∈ [−π, π).
     pub fn dequantize_angle(&self, i: usize) -> Result<f32> {
-        let levels = 1u32 << self.bits;
-        let idx = self.angle_index(i)? as f32;
-        Ok((idx / levels as f32) * (2.0 * PI) - PI)
+        let idx = self.angle_index(i)?;
+        // SAFETY: C function is pure computation on scalar values.
+        Ok(unsafe { tq_polar_dequantize_angle(idx, self.bits) })
     }
 
     /// Serialized payload bytes used by this code.
@@ -257,7 +262,12 @@ impl PolarQuantizer {
         for i in 0..pairs {
             let a = rotated[2 * i];
             let b = rotated[2 * i + 1];
-            let (r, idx) = encode_pair(a, b, self.bits);
+            let mut r = 0.0f32;
+            let mut idx: u16 = 0;
+            // SAFETY: C function writes to local stack variables via valid pointers.
+            unsafe {
+                tq_polar_encode_pair(a, b, self.bits, &mut r, &mut idx);
+            }
             radii.push(r);
             angle_indices.push(idx);
         }
@@ -382,14 +392,18 @@ fn check_finite_vector(vector: &[f32]) -> Result<()> {
 }
 
 /// Encode a Cartesian pair (a, b) into (radius, quantized_angle_index).
+///
+/// Delegates to the C kernel `tq_polar_encode_pair`. The original Rust
+/// implementation is archived in `src/archive/polar_rust.rs`.
+#[allow(dead_code)]
 fn encode_pair(a: f32, b: f32, bits: u8) -> (f32, u16) {
-    let r = (a * a + b * b).sqrt();
-    let theta = b.atan2(a); // ∈ [−π, π]
-    let levels = 1u32 << bits;
-    // Map [−π, π] → [0, 1) → [0, levels)
-    let normalized = (theta + PI) / (2.0 * PI);
-    let idx = (normalized * levels as f32).floor() as u32 % levels;
-    (r, idx as u16)
+    let mut r = 0.0f32;
+    let mut idx: u16 = 0;
+    // SAFETY: C function writes to local stack variables via valid pointers.
+    unsafe {
+        tq_polar_encode_pair(a, b, bits, &mut r, &mut idx);
+    }
+    (r, idx)
 }
 
 #[cfg(test)]

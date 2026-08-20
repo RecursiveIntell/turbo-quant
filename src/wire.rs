@@ -263,6 +263,100 @@ struct WireCursor<'a> {
     offset: usize,
 }
 
+/// Decoded TurboQuant wire header. The wire format carries the full
+/// quantizer profile (dim, bits, projections, seed, mode, rotation kind)
+/// in the first 44 bytes, so a `TurboCode` can be reconstructed from
+/// the wire bytes alone — no external quantizer required.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurboCodeWireHeader {
+    /// Original vector dimension.
+    pub dim: usize,
+    /// Polar-code bits per angle (b in the paper; b-1 for PolarWithQjl mode).
+    pub polar_bits: u8,
+    /// QJL projection count for the residual sketch.
+    pub qjl_projections: usize,
+    /// Seed used to derive the projection state.
+    pub seed: u64,
+    /// Number of polar code blocks (≈ dim / 2).
+    pub polar_block_count: usize,
+    /// QJL sign count (0 for PolarOnly mode).
+    pub qjl_sign_count: usize,
+    /// Length of the payload section following the header.
+    pub payload_len: u64,
+    /// Rotation kind embedded in the wire.
+    pub rotation_kind: RotationKind,
+}
+
+impl TurboCodeWireV1 {
+    /// Parse just the 44-byte wire header. This is the public entry point
+    /// for callers that want to extract the quantizer profile from the
+    /// wire format without validating against a specific quantizer instance.
+    pub fn parse_header(bytes: &[u8]) -> Result<TurboCodeWireHeader> {
+        if bytes.len() < 44 {
+            return Err(TurboQuantError::MalformedCode {
+                reason: format!("TurboQuant wire header is {} bytes, need 44", bytes.len()),
+            });
+        }
+        if &bytes[0..4] != TURBO_CODE_WIRE_MAGIC {
+            return Err(TurboQuantError::MalformedCode {
+                reason: "wrong TurboQuant wire magic".into(),
+            });
+        }
+        let version = u16::from_le_bytes(bytes[4..6].try_into().unwrap());
+        if version != VERSION {
+            return Err(TurboQuantError::MalformedCode {
+                reason: format!("unsupported TurboQuant wire version {version}"),
+            });
+        }
+        let wire_rotation_flag = u16::from_le_bytes(bytes[6..8].try_into().unwrap());
+        let rotation_kind = match wire_rotation_flag {
+            0 => RotationKind::Auto,
+            1 => RotationKind::FastHadamard,
+            2 => RotationKind::StoredQr,
+            _ => {
+                return Err(TurboQuantError::MalformedCode {
+                    reason: format!("unknown TurboQuant rotation flag {wire_rotation_flag}"),
+                })
+            }
+        };
+        let variant = bytes[8];
+        if variant != VARIANT_TURBO_CODE {
+            return Err(TurboQuantError::MalformedCode {
+                reason: format!("unsupported TurboQuant wire variant {variant}"),
+            });
+        }
+        let reserved = bytes[9];
+        if reserved != 0 {
+            return Err(TurboQuantError::MalformedCode {
+                reason: "nonzero TurboQuant wire reserved byte".into(),
+            });
+        }
+        let dim = u32::from_le_bytes(bytes[10..14].try_into().unwrap()) as usize;
+        let polar_bits = bytes[14];
+        let reserved2: [u8; 3] = bytes[15..18].try_into().unwrap();
+        if reserved2 != [0, 0, 0] {
+            return Err(TurboQuantError::MalformedCode {
+                reason: "nonzero TurboQuant wire reserved bytes".into(),
+            });
+        }
+        let qjl_projections = u32::from_le_bytes(bytes[18..22].try_into().unwrap()) as usize;
+        let seed = u64::from_le_bytes(bytes[22..30].try_into().unwrap());
+        let polar_block_count = u32::from_le_bytes(bytes[30..34].try_into().unwrap()) as usize;
+        let qjl_sign_count = u32::from_le_bytes(bytes[34..38].try_into().unwrap()) as usize;
+        let payload_len = u64::from_le_bytes(bytes[38..46].try_into().unwrap());
+        Ok(TurboCodeWireHeader {
+            dim,
+            polar_bits,
+            qjl_projections,
+            seed,
+            polar_block_count,
+            qjl_sign_count,
+            payload_len,
+            rotation_kind,
+        })
+    }
+}
+
 impl<'a> WireCursor<'a> {
     fn new(bytes: &'a [u8]) -> Self {
         Self { bytes, offset: 0 }
@@ -326,5 +420,55 @@ impl<'a> WireCursor<'a> {
             });
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_quantizer(dim: usize, seed: u64) -> TurboQuantizer {
+        // Use the simplest possible profile: PolarWithQjl, 8-bit, 32 projections.
+        TurboQuantizer::new(dim, 8, 32, seed).expect("quantizer build")
+    }
+
+    #[test]
+    fn parse_header_round_trips_encoded_code() {
+        let q = make_quantizer(128, 42);
+        let vector: Vec<f32> = (0..128).map(|i| (i as f32 / 128.0) - 0.5).collect();
+        let code = q.encode(&vector).expect("encode");
+        let wire = TurboCodeWireV1::encode(&code, &q).expect("wire encode");
+
+        let header = TurboCodeWireV1::parse_header(&wire).expect("parse header");
+        assert_eq!(header.dim, 128);
+        assert_eq!(header.qjl_projections, 32);
+        assert_eq!(header.seed, 42);
+        assert!(header.polar_block_count > 0);
+        assert!(header.payload_len > 0);
+    }
+
+    #[test]
+    fn parse_header_rejects_short_buffer() {
+        let bytes = vec![0u8; 10];
+        let result = TurboCodeWireV1::parse_header(&bytes);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_header_rejects_bad_magic() {
+        let mut bytes = vec![0u8; 44];
+        bytes[0..4].copy_from_slice(b"XXXX");
+        let result = TurboCodeWireV1::parse_header(&bytes);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_header_rejects_unsupported_version() {
+        let mut bytes = vec![0u8; 44];
+        bytes[0..4].copy_from_slice(TURBO_CODE_WIRE_MAGIC);
+        // version = 99 (unsupported)
+        bytes[4..6].copy_from_slice(&99u16.to_le_bytes());
+        let result = TurboCodeWireV1::parse_header(&bytes);
+        assert!(result.is_err());
     }
 }

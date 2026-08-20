@@ -295,25 +295,15 @@ fn check_dim(got: usize, expected: usize) -> Result<()> {
     Ok(())
 }
 
+// C FFI: replaced by c-kernels/fwht.c (tq_fwht_normalized).
+// Rust original archived in src/archive/fwht_rust.rs
+extern "C" {
+    fn tq_fwht_normalized(values: *mut f32, n: usize);
+}
+
 fn fwht_normalized(values: &mut [f32]) {
-    let n = values.len();
-    let mut step = 1;
-    while step < n {
-        let block = step * 2;
-        for start in (0..n).step_by(block) {
-            for offset in 0..step {
-                let a = values[start + offset];
-                let b = values[start + offset + step];
-                values[start + offset] = a + b;
-                values[start + offset + step] = a - b;
-            }
-        }
-        step = block;
-    }
-    let scale = (n as f32).sqrt().recip();
-    for value in values {
-        *value *= scale;
-    }
+    // SAFETY: values is a valid mutable slice; the C function operates in-place.
+    unsafe { tq_fwht_normalized(values.as_mut_ptr(), values.len()) }
 }
 
 mod matrix_serde {

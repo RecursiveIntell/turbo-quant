@@ -90,4 +90,4 @@ pub use qjl::{QjlProjectedQuery, QjlQuantizer, QjlSketch, QjlSketchProvenanceV1}
 pub use radius::{CompressedRadiiV1, RadiusCodecProfileV1};
 pub use rotation::{FastHadamardRotation, Rotation, RotationBackend, RotationKind, StoredRotation};
 pub use turbo::{BatchStats, TurboCode, TurboMode, TurboProjectedQuery, TurboQuantizer};
-pub use wire::{TurboCodeWireV1, TURBO_CODE_WIRE_MAGIC};
+pub use wire::{TurboCodeWireHeader, TurboCodeWireV1, TURBO_CODE_WIRE_MAGIC};
