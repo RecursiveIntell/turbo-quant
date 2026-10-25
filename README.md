@@ -10,7 +10,7 @@ Experimental Rust codecs for derived vector-compression sidecars: PolarQuant, Tu
 
 ![Exact vectors remain canonical while turbo-quant builds a compressed sidecar, generates approximate candidates, and requires exact reranking before promotion.](https://raw.githubusercontent.com/RecursiveIntell/turbo-quant/main/docs/architecture.svg)
 
-`turbo-quant` creates derived representations for experiments involving candidate generation, storage accounting, or approximate scoring. For a fixed `TurboQuantizer` configuration `(dim, bits, projections, seed)` and input vector, repeated encoding is deterministic. Approximate scores are not ground truth. Keep an exact fallback or rerank path and measure the workload locally.
+`turbo-quant` creates derived representations for experiments involving candidate generation, storage accounting, or approximate scoring. For a fixed quantizer created with `TurboQuantizer::new(dim, bits, projections, seed)` and a fixed input vector, repeated encoding is deterministic. Other constructors also require preserving their mode and rotation configuration. Approximate scores are not ground truth. Keep an exact fallback or rerank path and measure the workload locally.
 
 ## What this crate is not
 
