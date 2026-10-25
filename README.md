@@ -1,12 +1,20 @@
 # turbo-quant
 
-<!-- last-verified: 2026-08-20 -->
+<!-- last-verified: 2026-10-24 -->
+
+This marker records the local README review date (CDT), not a product or release validation date.
+
+## What this crate is
 
 Experimental Rust codecs for derived vector-compression sidecars: PolarQuant, TurboQuant, QJL sketches, packed wire formats, candidate search, exact-rerank receipts, and KV-cache shadow experiments.
 
 ![Exact vectors remain canonical while turbo-quant builds a compressed sidecar, generates approximate candidates, and requires exact reranking before promotion.](https://raw.githubusercontent.com/RecursiveIntell/turbo-quant/main/docs/architecture.svg)
 
-`turbo-quant` does not replace the caller's exact vectors. It creates deterministic, derived representations that can reduce candidate-generation cost or storage for an experiment. Approximate scores are not ground truth: keep an exact fallback or rerank path and measure the workload locally.
+`turbo-quant` creates derived representations for experiments involving candidate generation, storage accounting, or approximate scoring. For a fixed quantizer created with `TurboQuantizer::new(dim, bits, projections, seed)` and a fixed input vector, repeated encoding is deterministic. Other constructors also require preserving their mode and rotation configuration. Approximate scores are not ground truth. Keep an exact fallback or rerank path and measure the workload locally.
+
+## What this crate is not
+
+This crate is not a canonical vector store. It is not a replacement for exact vectors in correctness-sensitive retrieval. Its experimental codecs do not guarantee quality or performance for every dimension, model, corpus, filter, or KV-cache workload, and do not establish paper parity or suitability for a particular deployment. The raw vector remains the correctness reference whenever an exact result is required.
 
 ## What is included
 
@@ -39,10 +47,12 @@ The raw vector remains the correctness reference whenever the application needs 
 
 ```toml
 [dependencies]
-turbo-quant = "0.2.3"
+turbo-quant = "0.2"
 ```
 
-The crate targets Rust 1.75 and uses the 2021 edition. A C compiler is required for the build-time kernels in the published 0.2.3 package; GCC and Clang-style toolchains are the intended environments.
+The dependency snippet uses Cargo requirement `0.2`, which matches versions from the 0.2 release line according to Cargo's version-requirement rules. This selector is not a separate API-compatibility promise; the repository manifest declares package version 0.2.3.
+
+The crate targets Rust 1.75 and uses the 2021 edition. Building this source requires a compatible C compiler: `build.rs` uses the `cc` crate to compile the C kernels under `c-kernels/`.
 
 ## Quick start
 
@@ -68,11 +78,57 @@ fn main() -> Result<(), turbo_quant::TurboQuantError> {
 }
 ```
 
-The repository also carries `examples/compat_0_1_smoke.rs`, which exercises the compatibility surface, packed types, and KV cache helper. Run it with:
+## Sidecar candidate search
 
-```bash
-cargo run --example compat_0_1_smoke
+`TurboSidecarIndex` stores compressed codes alongside caller-owned IDs and returns candidates ranked by approximate inner-product estimates. Use those IDs to fetch authoritative vectors, then rerank with the caller's exact scorer before treating the results as exact:
+
+```rust
+use turbo_quant::{SearchOptions, TurboQuantizer, TurboSidecarIndex};
+
+fn main() -> Result<(), turbo_quant::TurboQuantError> {
+    let quantizer = TurboQuantizer::new(4, 8, 2, 42)?;
+    let mut sidecar = TurboSidecarIndex::new(quantizer);
+    sidecar.add("doc-a", &[0.1, 0.2, 0.3, 0.4], Some("doc-a-v1".into()))?;
+    sidecar.add("doc-b", &[0.4, 0.3, 0.2, 0.1], Some("doc-b-v1".into()))?;
+
+    let query = [0.2, 0.1, 0.4, 0.3];
+    let (candidates, receipt) = sidecar.search(
+        &query,
+        SearchOptions { top_k: 1, oversample: 4 },
+    )?;
+    assert!(receipt.approximate_only);
+    assert!(receipt.exact_rerank_required);
+    println!("candidate IDs: {:?}", candidates.iter().map(|c| &c.id).collect::<Vec<_>>());
+    Ok(())
+}
 ```
+
+The index does not own or return the original vectors. Resolve candidate IDs against the caller's exact store and apply its exact scoring and promotion policy.
+
+## KV-cache shadow mode
+
+`KvCacheCompressor::new_runtime` accepts separate key and value policies. This example quantizes keys while retaining exact values and exact shadows so the approximate key scores can be compared with exact scores:
+
+```rust
+use turbo_quant::{KvCacheCompressor, KvQuantPolicy, KvRuntimeConfig};
+
+fn main() -> Result<(), turbo_quant::TurboQuantError> {
+    let mut cache = KvCacheCompressor::new_runtime(KvRuntimeConfig {
+        head_dim: 4,
+        key_policy: KvQuantPolicy::quantized(8, 2),
+        value_policy: KvQuantPolicy::Exact,
+        seed: 42,
+        keep_exact_shadow: true,
+    })?;
+    cache.compress_token(&[0.1, 0.2, 0.3, 0.4], &[0.4, 0.3, 0.2, 0.1])?;
+
+    let comparisons = cache.shadow_attention_scores(&[0.2, 0.1, 0.4, 0.3])?;
+    println!("shadow score comparisons: {comparisons:?}");
+    Ok(())
+}
+```
+
+This is an experiment surface, not a deployed-attention validation; measure quality and memory behavior on the target workload before considering integration.
 
 ## API map
 
@@ -91,6 +147,14 @@ cargo run --example compat_0_1_smoke
 
 See the rustdoc for method-level signatures and error behavior.
 
+## API compatibility
+
+The repository's `examples/compat_0_1_smoke.rs` is a compile-time smoke check for the listed legacy types (`PolarCode`, `QjlSketch`, `TurboCode`, `KvCacheConfig`, and `CompressedToken`) and the APIs used by that example. It is not a guarantee for every downstream integration; run it when upgrading:
+
+```bash
+cargo run --example compat_0_1_smoke
+```
+
 ## Configuration guidance
 
 Choose parameters from a local gate, not this README. In general:
@@ -105,9 +169,13 @@ Choose parameters from a local gate, not this README. In general:
 
 The packed and wire modules validate headers, dimensions, bit widths, projection counts, rotation identity, payload lengths, padding, and finite values. Round-trip tests cover valid encodings and malformed artifacts. Treat decoded data as untrusted input and handle `TurboQuantError` rather than assuming a wire payload is valid.
 
-## Verification
+## Release honesty
 
-The release-source checkout was verified on 2026-08-20 with:
+This section does not qualify a release. The repository declares version 0.2.3 in `Cargo.toml`. Treat the crate as an experimental codec substrate: a successful build or benchmark receipt does not establish paper parity, deployment quality, or a universal accuracy, memory, or speed result. Before adopting it, verify the specific release artifact and compiler requirements, then measure candidate recall, exact-rerank behavior, and memory accounting on your own workload. Benchmark gates are workload-specific.
+
+## Testing before release
+
+Run the repository's Rust checks from the crate root:
 
 ```bash
 cargo fmt --check
@@ -116,7 +184,7 @@ cargo test --all-targets
 cargo clippy --all-targets -- -D warnings
 ```
 
-Those commands passed for the synchronized 0.2.3 source. The test suite covers deterministic encoding, malformed inputs, serialization, wire validation, packed indexes, approximate scoring, KV policy, compatibility, and candidate-search behavior. Re-run the commands locally for evidence from your compiler and target platform.
+These commands test the checked-out source and toolchain; results do not automatically transfer to another platform or a published package. Do not treat an experimental benchmark as a deployment qualification.
 
 ## Repository layout
 
@@ -131,7 +199,7 @@ Those commands passed for the synchronized 0.2.3 source. The test suite covers d
 
 `turbo-quant` is a reusable sidecar primitive. Integrations with a memory or retrieval system must define their own admission, exact-fallback, and promotion policy. If you use it with [`semantic-memory`](https://github.com/RecursiveIntell/semantic-memory) or another store, treat the store's exact vectors and receipts as canonical and validate the integration at the application boundary.
 
-## License and links
+## License
 
 Dual-licensed under MIT or Apache-2.0; see [`LICENSE-MIT`](https://github.com/RecursiveIntell/turbo-quant/blob/main/LICENSE-MIT) and [`LICENSE-APACHE`](https://github.com/RecursiveIntell/turbo-quant/blob/main/LICENSE-APACHE).
 
